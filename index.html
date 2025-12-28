@@ -1,0 +1,665 @@
+
+<!doctype html>
+<html lang="id" class="h-full">
+ <head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Aplikasi Pengiriman Makanan - Sistem Privat</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { box-sizing: border-box; background-color: #f8f9fa; font-family: system-ui, -apple-system, sans-serif; }
+    .menu-item-card { transition: transform 0.2s, box-shadow 0.2s; }
+    .menu-item-card:hover { transform: translateY(-2px); box-shadow: 0 8px 16px rgba(0,0,0,0.1); }
+    
+    /* Loading Screen Customization */
+    .loading-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: #ffffff; display: flex; flex-direction: column; justify-content: center; align-items: center; z-index: 9999; text-align: center; }
+    
+    .food-loader {
+        position: relative;
+        width: 80px;
+        height: 80px;
+        margin-bottom: 20px;
+    }
+    
+    .food-icon-animate {
+        font-size: 40px;
+        animation: foodBounce 1s ease-in-out infinite;
+    }
+    
+    .loader-ring {
+        position: absolute;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        border: 4px solid #f3f3f3;
+        border-top: 4px solid #00aa13;
+        border-radius: 50%;
+        animation: spin 1s linear infinite;
+    }
+
+    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    @keyframes foodBounce {
+        0%, 100% { transform: translateY(0) scale(1); }
+        50% { transform: translateY(-15px) scale(1.1); }
+    }
+
+    .btn-nav { padding: 0.5rem 1rem; border-radius: 0.5rem; color: white; background: #6b7280; transition: 0.2s; font-weight: 600; }
+    .badge-pulse { animation: pulse 2s infinite; }
+    @keyframes pulse { 0% { transform: scale(1); } 50% { transform: scale(1.1); } 100% { transform: scale(1); } }
+    .edit-mode-border { border: 2px solid #00aa13 !important; background-color: #f0fff4; }
+    
+    .rotate-anim { animation: rotate 1s linear infinite; }
+    @keyframes rotate { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+  </style>
+ </head>
+ <body class="h-full text-black">
+  <!-- Layar Pemuatan Bertema Makanan -->
+  <div id="loading-screen" class="loading-overlay">
+    <div id="loading-container" class="flex flex-col items-center">
+        <div class="food-loader">
+            <div class="loader-ring"></div>
+            <div class="absolute inset-0 flex items-center justify-center">
+                <span class="food-icon-animate">🍳</span>
+            </div>
+        </div>
+        <p id="loading-status-text" class="text-green-600 font-bold text-lg">Menyiapkan Dapur...</p>
+        <p class="text-gray-400 text-sm mt-1">Menghubungkan ke pusat pesanan</p>
+    </div>
+    
+    <div id="error-box" class="hidden mt-4 p-6 bg-white shadow-xl border-t-4 border-red-500 rounded-xl text-sm max-w-sm mx-auto">
+        <p class="font-bold text-red-700 text-lg mb-2">Gagal Terhubung</p>
+        <p id="error-message" class="text-gray-600 mb-4"></p>
+        <button onclick="location.reload()" class="w-full bg-red-600 text-white py-2 rounded-lg font-bold shadow-md text-sm uppercase tracking-wider">Coba Lagi</button>
+    </div>
+  </div>
+
+  <div id="app" class="h-full w-full overflow-auto"></div>
+  
+  <!-- Audio Notifikasi -->
+  <audio id="notif-sound" src="https://assets.mixkit.co/active_storage/sfx/2869/2869-preview.mp3" preload="auto"></audio>
+
+  <script>
+    // --- 1. KONFIGURASI ---
+    const GOOGLE_SHEETS_URL = 'https://script.google.com/macros/s/AKfycbz9X1YpP4ZRwbn9y08Me2UE2m7TvoogMlw-2c_NJwlcNR-y4LdudC_cN61R-h5aHu0/exec';
+
+    let foodItems = [];
+    let orderRecords = [];
+    let cartItems = [];
+    let currentView = 'restaurants';
+    let searchQuery = '';
+    let editingItemId = null;
+    let isFirstLoad = true;
+    let isSaving = false;
+    let isRefreshing = false;
+    let myBuyerId = ''; 
+    let lastKnownOrderIds = new Set(); 
+
+    // Variabel filter tanggal
+    let statsStartDate = '';
+    let statsEndDate = '';
+
+    // --- 2. OPERASI API ---
+    async function apiRequest(payload) {
+        try {
+            await fetch(GOOGLE_SHEETS_URL, {
+                method: 'POST',
+                mode: 'no-cors', 
+                headers: { 'Content-Type': 'text/plain' },
+                body: JSON.stringify(payload)
+            });
+            return true;
+        } catch (e) { 
+            console.error("Kesalahan API:", e);
+            return false; 
+        }
+    }
+
+    async function loadData(isAuto = false) {
+        if (isAuto && (editingItemId !== null || isSaving)) return;
+
+        try {
+            const response = await fetch(GOOGLE_SHEETS_URL + "?t=" + Date.now());
+            if (!response.ok) throw new Error("Server error");
+            
+            const data = await response.json();
+            
+            foodItems = data.filter(i => (i.type || i.Type) === 'food');
+            const newOrderRecords = data.filter(i => (i.type || i.Type) === 'order');
+            
+            if (!isFirstLoad) {
+                let hasNewOrder = false;
+                newOrderRecords.forEach(order => {
+                    if (!lastKnownOrderIds.has(String(order.id))) {
+                        hasNewOrder = true;
+                    }
+                });
+
+                if (hasNewOrder) {
+                    playNotificationSound();
+                    showToast("🔔 Pesanan Baru Masuk!");
+                }
+            }
+
+            orderRecords = newOrderRecords;
+            lastKnownOrderIds = new Set(orderRecords.map(o => String(o.id)));
+            
+            if (currentView === 'admin') {
+                const formExists = document.getElementById('admin-form');
+                if (!formExists) renderAdminView();
+                else renderAdminDynamicParts();
+            } else {
+                renderView();
+            }
+
+            updateUnreadBadges();
+            
+            // Berikan sedikit delay agar transisi loading terlihat halus
+            setTimeout(() => {
+                const ls = document.getElementById('loading-screen');
+                if (ls) {
+                    ls.style.opacity = '0';
+                    setTimeout(() => { ls.style.display = 'none'; }, 300);
+                }
+            }, 500);
+
+            isFirstLoad = false;
+        } catch (e) { 
+            console.error("Load Error:", e);
+            const container = document.getElementById('loading-container');
+            const error = document.getElementById('error-box');
+            if (container && error) {
+                container.classList.add('hidden');
+                error.classList.remove('hidden');
+                document.getElementById('error-message').innerText = "Terjadi kesalahan saat memproses data.";
+            }
+        }
+    }
+
+    // Fungsi manual refresh
+    async function manualRefresh() {
+        if (isRefreshing) return;
+        isRefreshing = true;
+        showToast("🔄 Menyegarkan data...");
+        
+        const btn = document.getElementById('refresh-btn');
+        if (btn) btn.classList.add('opacity-50', 'pointer-events-none');
+        
+        await loadData();
+        
+        isRefreshing = false;
+        if (btn) btn.classList.remove('opacity-50', 'pointer-events-none');
+    }
+
+    // --- 3. HELPERS ---
+    function getReadOrders() { try { return JSON.parse(localStorage.getItem('read_orders')) || []; } catch (e) { return []; } }
+    function markOrderAsRead(id) {
+        const readList = getReadOrders();
+        if (!readList.includes(id)) {
+            readList.push(id);
+            localStorage.setItem('read_orders', JSON.stringify(readList));
+            updateUnreadBadges();
+            if (currentView === 'orders') renderOrdersView();
+        }
+    }
+    
+    function playNotificationSound() { 
+        const audio = document.getElementById('notif-sound'); 
+        if (audio) {
+            audio.currentTime = 0; 
+            audio.play().catch(e => console.log("Audio play deferred.")); 
+        }
+    }
+
+    // --- 4. AKSI DATA ---
+    async function handleAddFood(e) {
+        e.preventDefault();
+        isSaving = true;
+        const btn = document.getElementById('add-food-btn');
+        const originalText = btn.innerText;
+        btn.disabled = true; btn.innerText = "Memproses...";
+
+        let imgData = "";
+        const fileInput = document.getElementById('food-image');
+        const file = fileInput.files[0];
+
+        if (file) {
+            imgData = await new Promise(r => { 
+                const rd = new FileReader(); 
+                rd.onload = ev => r(ev.target.result); 
+                rd.readAsDataURL(file); 
+            });
+        } else if (editingItemId) {
+            const existing = foodItems.find(f => String(f.id) === String(editingItemId));
+            imgData = existing ? (existing.image || "") : "";
+        }
+
+        const payload = {
+            action: editingItemId ? "update" : "create",
+            id: editingItemId || `food-${Date.now()}`,
+            type: 'food',
+            name: document.getElementById('food-name').value,
+            price: parseInt(document.getElementById('food-price').value),
+            unit: document.getElementById('food-unit').value,
+            image: imgData,
+            description: document.getElementById('food-description').value,
+            category: document.getElementById('food-category').value,
+            restaurant_name: document.getElementById('food-restaurant').value,
+            discount: parseInt(document.getElementById('food-discount').value) || 0,
+            shipping_cost: parseInt(document.getElementById('food-shipping').value) || 0,
+            status: document.getElementById('food-status').value 
+        };
+
+        const success = await apiRequest(payload);
+        if (success) {
+            showToast(editingItemId ? "Perubahan Disimpan!" : "Menu Ditambahkan!");
+            cancelEdit();
+            setTimeout(() => { isSaving = false; loadData(true); }, 1500);
+        } else {
+            isSaving = false;
+            showToast("Gagal terhubung ke server.");
+            btn.disabled = false; btn.innerText = originalText;
+        }
+    }
+
+    async function updateOrderStatus(id, newStatus) {
+        const order = orderRecords.find(o => o.id === id);
+        if(order) order.status = newStatus;
+        renderOrdersView();
+        await apiRequest({ action: "update_status", id: id, status: newStatus });
+        showToast("Status diperbarui");
+        setTimeout(() => loadData(true), 2000);
+    }
+
+    async function deleteItem(id) {
+        if(!id) return;
+        if(!confirm("Hapus data ini secara permanen dari daftar?")) return;
+
+        showToast("Menghapus...");
+        const stringId = String(id).trim();
+        
+        foodItems = foodItems.filter(f => String(f.id).trim() !== stringId);
+        orderRecords = orderRecords.filter(o => String(o.id).trim() !== stringId);
+        
+        renderView();
+
+        const success = await apiRequest({ action: "delete", id: stringId });
+        if(success) {
+            showToast("Berhasil terhapus!");
+            setTimeout(() => loadData(true), 3000);
+        } else {
+            showToast("Gagal menghapus di server.");
+            loadData(true);
+        }
+    }
+
+    // --- 5. RENDERERS ---
+    function switchView(view) {
+        currentView = view;
+        editingItemId = null;
+        isSaving = false;
+        renderAppFrame();
+        renderView();
+    }
+
+    function renderView() {
+        const content = document.getElementById('main-content');
+        if(!content) { renderAppFrame(); return; }
+        if (currentView === 'restaurants') renderRestaurants();
+        else if (currentView === 'admin') renderAdminView();
+        else if (currentView === 'orders') renderOrdersView();
+    }
+
+    function renderAppFrame() {
+        document.getElementById('app').innerHTML = `
+            <nav class="bg-white shadow-sm sticky top-0 z-50 p-4 border-b border-gray-100">
+                <div class="max-w-6xl mx-auto flex justify-end items-center">
+                    <div class="flex gap-2">
+                        <button onclick="switchView('restaurants')" id="nav-restaurants" class="btn-nav">🏠 Home</button>
+                        <button onclick="switchView('admin')" id="nav-admin" class="btn-nav">⚙️ Admin</button>
+                        <button onclick="switchView('orders')" id="nav-orders" class="btn-nav relative">📋 Pesanan <span id="badge-orders" class="hidden absolute -top-1 -right-1 bg-red-500 text-[10px] px-1 rounded-full text-white font-bold"></span></button>
+                    </div>
+                </div>
+            </nav>
+            <div id="search-container" class="max-w-6xl mx-auto p-4 ${currentView !== 'restaurants' ? 'hidden' : ''}">
+                <input type="text" id="search-input" oninput="doSearch(event)" placeholder="Cari menu favorit..." class="w-full p-3 border rounded-lg shadow-sm">
+            </div>
+            <main id="main-content" class="max-w-6xl mx-auto p-4"></main>
+        `;
+        updateNavState();
+    }
+
+    function renderRestaurants() {
+        const filtered = foodItems.filter(f => 
+            (f.status === 'Aktif' || !f.status) && 
+            (f.name||'').toLowerCase().includes(searchQuery.toLowerCase())
+        );
+        
+        document.getElementById('main-content').innerHTML = `
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                ${filtered.map(f => `
+                <div class="bg-white rounded-xl shadow-sm p-4 menu-item-card flex flex-col border border-gray-100">
+                    <img src="${f.image}" onerror="this.src='https://placehold.co/300x200?text=Tanpa+Gambar'" class="w-full h-32 object-cover rounded-lg mb-2">
+                    <h3 class="font-bold text-sm text-gray-800">${f.name}</h3>
+                    <div class="mt-auto">
+                        <p class="font-bold text-green-600 text-sm">Rp ${(f.price - (f.discount || 0)).toLocaleString()}</p>
+                        <button onclick="addToCart('${f.id}')" class="w-full mt-2 bg-green-600 text-white py-2 rounded-lg font-bold text-xs">Beli</button>
+                    </div>
+                </div>`).join('') || '<p class="col-span-full text-center text-gray-400 py-10 font-bold">Menu tidak tersedia saat ini.</p>'}
+            </div>`;
+    }
+
+    function renderAdminView() {
+        document.getElementById('main-content').innerHTML = `
+            <!-- Filter Tanggal Statistik -->
+            <div class="bg-white p-4 rounded-xl shadow-sm mb-6 border border-gray-100">
+                <div class="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                    <div>
+                        <h4 class="text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Filter Periode Statistik</h4>
+                        <div class="flex items-center gap-2">
+                            <input type="date" id="filter-start" value="${statsStartDate}" onchange="updateDateFilter()" class="border p-2 rounded text-sm text-gray-700 bg-gray-50 focus:ring-2 focus:ring-green-500 outline-none">
+                            <span class="text-gray-400 text-sm">s/d</span>
+                            <input type="date" id="filter-end" value="${statsEndDate}" onchange="updateDateFilter()" class="border p-2 rounded text-sm text-gray-700 bg-gray-50 focus:ring-2 focus:ring-green-500 outline-none">
+                            <button onclick="resetDateFilter()" class="text-xs font-bold text-red-500 ml-2 hover:bg-red-50 p-2 rounded">RESET</button>
+                        </div>
+                    </div>
+                    <div id="filter-label" class="hidden text-[10px] bg-green-100 text-green-700 px-2 py-1 rounded-full font-bold self-start md:self-center">FILTER AKTIF</div>
+                </div>
+            </div>
+
+            <div id="admin-stats-container" class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6"></div>
+
+            <div id="admin-form-container" class="bg-white p-6 rounded-xl shadow-sm mb-6 border border-gray-100 transition-all">
+                <h3 id="form-title" class="text-lg font-bold mb-4 text-green-700">Input Data Menu</h3>
+                <form onsubmit="handleAddFood(event)" id="admin-form" class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <input id="food-name" placeholder="Nama Makanan" class="p-2 border rounded text-sm text-black" required>
+                    <div class="flex gap-2">
+                        <input id="food-price" type="number" placeholder="Harga" class="flex-1 p-2 border rounded text-sm text-black" required>
+                        <select id="food-unit" class="p-2 border rounded text-sm text-black"><option>Pcs</option><option>Cup</option><option>Porsi</option></select>
+                    </div>
+                    <input id="food-restaurant" placeholder="Nama Toko" class="p-2 border rounded text-sm text-black">
+                    <div class="flex gap-2">
+                        <input id="food-category" placeholder="Kategori" class="flex-1 p-2 border rounded text-sm text-black">
+                        <select id="food-status" class="flex-1 p-2 border rounded text-sm text-black bg-white">
+                            <option value="Aktif">Status: Aktif</option>
+                            <option value="Tidak Aktif">Status: Tidak Aktif</option>
+                        </select>
+                    </div>
+                    <textarea id="food-description" placeholder="Deskripsi Singkat" class="p-2 border rounded text-sm md:col-span-2 text-black"></textarea>
+                    <div class="flex gap-2">
+                        <input id="food-discount" type="number" placeholder="Diskon (Rp)" class="flex-1 p-2 border rounded text-sm text-black">
+                        <input id="food-shipping" type="number" placeholder="Ongkir" class="flex-1 p-2 border rounded text-sm text-black">
+                    </div>
+                    <div class="md:col-span-2 space-y-2">
+                        <div id="image-preview-container" class="hidden flex items-center gap-4 p-2 bg-gray-50 rounded border border-dashed border-gray-300">
+                            <img id="img-preview" src="" class="w-20 h-20 object-cover rounded shadow-sm">
+                            <p class="text-[10px] text-gray-500 italic">Gambar yang sedang digunakan.</p>
+                        </div>
+                        <input type="file" id="food-image" accept="image/*" onchange="previewSelectedImage(this)" class="p-2 border rounded text-xs text-black w-full">
+                    </div>
+                    <div class="md:col-span-2 flex gap-2 pt-2 text-white font-bold">
+                        <button id="add-food-btn" type="submit" class="flex-1 bg-green-600 p-3 rounded-lg hover:bg-green-700 shadow-md transition">Simpan Menu</button>
+                        <button type="button" onclick="cancelEdit()" id="cancel-btn" class="hidden bg-gray-400 p-3 rounded-lg transition">Batal / Reset</button>
+                    </div>
+                </form>
+            </div>
+            <div id="admin-food-list"></div>
+        `;
+        renderAdminDynamicParts();
+    }
+
+    function updateDateFilter() {
+        statsStartDate = document.getElementById('filter-start').value;
+        statsEndDate = document.getElementById('filter-end').value;
+        const filterLabel = document.getElementById('filter-label');
+        if (statsStartDate || statsEndDate) filterLabel.classList.remove('hidden');
+        else filterLabel.classList.add('hidden');
+        renderAdminDynamicParts();
+    }
+
+    function resetDateFilter() {
+        statsStartDate = ''; statsEndDate = '';
+        document.getElementById('filter-start').value = '';
+        document.getElementById('filter-end').value = '';
+        document.getElementById('filter-label').classList.add('hidden');
+        renderAdminDynamicParts();
+    }
+
+    function renderAdminDynamicParts() {
+        const statsEl = document.getElementById('admin-stats-container');
+        const listEl = document.getElementById('admin-food-list');
+        if (!statsEl || !listEl) return;
+        const stats = calculateStats();
+        
+        statsEl.innerHTML = `
+            <div class="bg-blue-50 p-4 rounded-lg border-l-4 border-blue-500">
+                <p class="text-xs text-blue-600 font-bold uppercase tracking-wider">Total Menu</p>
+                <p class="text-2xl font-bold">${foodItems.length}</p>
+            </div>
+            <div class="bg-green-50 p-4 rounded-lg border-l-4 border-green-500">
+                <p class="text-xs text-green-600 font-bold uppercase tracking-wider">Terjual</p>
+                <p class="text-2xl font-bold">${stats.sold}</p>
+            </div>
+            <div class="bg-orange-50 p-4 rounded-lg border-l-4 border-orange-500">
+                <p class="text-xs text-orange-600 font-bold uppercase tracking-wider">Pendapatan</p>
+                <p class="text-xl font-bold">Rp ${stats.revenue.toLocaleString()}</p>
+            </div>
+        `;
+
+        listEl.innerHTML = `
+            <h3 class="font-bold mb-3 text-gray-700">Daftar Menu Aktif (${foodItems.length})</h3>
+            <div class="space-y-2">
+                ${foodItems.map(f => {
+                    const isActive = f.status === 'Aktif' || !f.status;
+                    return `
+                    <div class="bg-white p-3 rounded-lg shadow-sm flex justify-between items-center border border-gray-100">
+                        <div class="flex gap-3 items-center text-black">
+                            <img src="${f.image}" class="w-10 h-10 rounded object-cover shadow-sm" onerror="this.src='https://placehold.co/50'">
+                            <div>
+                                <p class="font-bold text-sm text-gray-800">${f.name}</p>
+                                <div class="flex items-center gap-2">
+                                    <p class="text-[10px] text-gray-500 font-bold">Rp ${parseInt(f.price).toLocaleString()}</p>
+                                    <span class="text-[8px] px-1.5 py-0.5 rounded-full font-bold uppercase ${isActive ? 'bg-green-100 text-green-600' : 'bg-red-100 text-red-600'}">
+                                        ${isActive ? 'Aktif' : 'Tidak Aktif'}
+                                    </span>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="flex gap-1 text-black font-bold">
+                            <button onclick="window.startEdit('${f.id}')" class="bg-blue-50 text-blue-600 px-3 py-1 rounded text-xs hover:bg-blue-100">Edit</button>
+                            <button onclick="window.deleteItem('${f.id}')" class="bg-red-50 text-red-600 px-3 py-1 rounded text-xs uppercase hover:bg-red-100">Hapus</button>
+                        </div>
+                    </div>`;
+                }).join('') || '<p class="text-center text-gray-400 py-5 font-bold">Belum ada menu.</p>'}
+            </div>`;
+    }
+
+    function renderOrdersView() {
+        const now = Date.now();
+        const readList = getReadOrders();
+        const activeOrders = orderRecords.filter(o => {
+            if (o.status === 'Selesai') {
+                const orderTime = new Date(o.orderDate).getTime();
+                return (now - orderTime) < 300000; 
+            }
+            return true;
+        });
+        const sorted = [...activeOrders].sort((a,b) => new Date(b.orderDate) - new Date(a.orderDate));
+        
+        document.getElementById('main-content').innerHTML = `
+            <div class="flex justify-between items-center mb-6">
+                <h2 class="text-xl font-bold text-gray-800">Semua Pesanan Masuk (Admin)</h2>
+                <button id="refresh-btn" onclick="manualRefresh()" class="flex items-center gap-2 bg-white border border-gray-200 px-4 py-2 rounded-lg text-sm font-bold shadow-sm hover:bg-gray-50 transition active:scale-95">
+                    <span class="${isRefreshing ? 'rotate-anim' : ''}">🔄</span> Refresh Data
+                </button>
+            </div>
+            ${sorted.length === 0 ? '<p class="text-center py-10 text-gray-400 font-bold">Belum ada pesanan aktif.</p>' : sorted.map(o => {
+                const isRead = readList.includes(o.id);
+                const total = (parseInt(o.price)||0) - (parseInt(o.discount)||0) + (parseInt(o.shipping_cost)||0);
+                const orderTime = new Date(o.orderDate).getTime();
+                const timePassed = Math.floor((now - orderTime) / 60000);
+                
+                let btn = '';
+                if (o.status === 'Menunggu') btn = `<button onclick="updateOrderStatus('${o.id}', 'Diproses')" class="w-full bg-blue-500 text-white py-2 rounded-lg font-bold mt-2">Terima & Proses 🍳</button>`;
+                else if (o.status === 'Diproses') btn = `<button onclick="updateOrderStatus('${o.id}', 'Dikirim')" class="w-full bg-orange-500 text-white py-2 rounded-lg font-bold mt-2 text-sm">Kirim Pesanan 🛵</button>`;
+                else if (o.status === 'Dikirim') btn = `<button onclick="updateOrderStatus('${o.id}', 'Selesai')" class="w-full bg-green-600 text-white py-2 rounded-lg font-bold mt-2 text-sm">Selesaikan Pesanan ✅</button>`;
+                else btn = `<p class="text-center text-green-600 font-bold py-2 text-sm italic">Pesanan Selesai 🎉 (Hilang dalam ${5 - timePassed} mnt)</p>`;
+
+                return `
+                <div class="bg-white p-4 rounded-xl shadow-sm border-l-4 ${o.status==='Selesai'?'border-green-500':'border-yellow-500'} mb-4 ${isRead ? 'opacity-60' : ''}">
+                    <div class="flex justify-between mb-2"><h4 class="font-bold text-gray-800 text-sm text-black">${o.name}</h4><span class="text-[10px] font-bold px-2 py-1 bg-gray-100 rounded text-black">${o.status}</span></div>
+                    <div class="text-xs text-gray-600 mb-3 space-y-1 text-black">
+                        <p>👤 <b>${o.buyer?.name || '-'}</b></p>
+                        <p class="text-[10px] text-gray-400">UID: ${o.buyer?.id || 'Lama'}</p>
+                        <p>📍 ${o.buyer?.address || '-'}</p>
+                        <p>📞 ${o.buyer?.phone || '-'}</p>
+                    </div>
+                    <p class="font-bold text-green-700 text-sm">Total Tagihan: Rp ${total.toLocaleString()}</p>
+                    ${btn}
+                    <div class="flex gap-2 mt-4 pt-4 border-t border-gray-100">
+                        ${!isRead ? `<button onclick="markOrderAsRead('${o.id}')" class="flex-1 text-[10px] bg-gray-100 py-1 rounded font-bold text-gray-700 border border-gray-200 uppercase">Baca</button>` : ''}
+                        <button onclick="window.deleteItem('${o.id}')" class="flex-1 text-[10px] text-red-500 py-2 border border-red-200 rounded font-bold uppercase hover:bg-red-50 transition">Hapus Data</button>
+                    </div>
+                </div>`;
+            }).join('')}`;
+    }
+
+    function addToCart(id) {
+        showToast("Pesanan internal dicatat (Simulasi Pembelian)");
+    }
+
+    function startEdit(id) {
+        const f = foodItems.find(i => String(i.id).trim() === String(id).trim());
+        if(!f) return;
+        
+        editingItemId = id;
+        const formContainer = document.getElementById('admin-form-container');
+        if (formContainer) formContainer.classList.add('edit-mode-border');
+        
+        document.getElementById('form-title').innerText = "Mode Edit: " + f.name;
+        document.getElementById('food-name').value = f.name || '';
+        document.getElementById('food-price').value = f.price || 0;
+        document.getElementById('food-unit').value = f.unit || 'Pcs';
+        document.getElementById('food-restaurant').value = f.restaurant_name || '';
+        document.getElementById('food-category').value = f.category || '';
+        document.getElementById('food-description').value = f.description || '';
+        document.getElementById('food-discount').value = f.discount || 0;
+        document.getElementById('food-shipping').value = f.shipping_cost || 0;
+        document.getElementById('food-status').value = f.status || 'Aktif'; 
+        
+        const previewContainer = document.getElementById('image-preview-container');
+        const previewImg = document.getElementById('img-preview');
+        if (previewContainer && previewImg) {
+            previewImg.src = f.image || 'https://placehold.co/100';
+            previewContainer.classList.remove('hidden');
+        }
+
+        document.getElementById('cancel-btn').classList.remove('hidden');
+        document.getElementById('add-food-btn').innerText = "Simpan Perubahan";
+        document.getElementById('admin-form').scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+
+    function cancelEdit() {
+        editingItemId = null;
+        const form = document.getElementById('admin-form');
+        const formContainer = document.getElementById('admin-form-container');
+        if(form) form.reset();
+        if(formContainer) formContainer.classList.remove('edit-mode-border');
+        
+        document.getElementById('form-title').innerText = "Input Data Menu";
+        document.getElementById('cancel-btn').classList.add('hidden');
+        document.getElementById('add-food-btn').innerText = "Simpan Menu";
+        document.getElementById('image-preview-container').classList.add('hidden');
+        document.getElementById('food-image').value = "";
+    }
+
+    function previewSelectedImage(input) {
+        const file = input.files[0];
+        if (file) {
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                const previewContainer = document.getElementById('image-preview-container');
+                const previewImg = document.getElementById('img-preview');
+                previewImg.src = e.target.result;
+                previewContainer.classList.remove('hidden');
+            }
+            reader.readAsDataURL(file);
+        }
+    }
+
+    function doSearch(e) { searchQuery = e.target.value; renderRestaurants(); }
+    
+    function updateNavState() {
+        ['restaurants', 'admin', 'orders'].forEach(n => {
+            const el = document.getElementById('nav-' + n);
+            if(el) el.style.backgroundColor = (currentView === n ? '#00aa13' : '#6b7280');
+        });
+    }
+    
+    function calculateStats() {
+        const filteredOrders = orderRecords.filter(o => {
+            if (!o.orderDate) return false;
+            const orderDateObj = new Date(o.orderDate);
+            if (isNaN(orderDateObj.getTime())) return false;
+            const orderDateStr = orderDateObj.toISOString().split('T')[0];
+            if (statsStartDate && orderDateStr < statsStartDate) return false;
+            if (statsEndDate && orderDateStr > statsEndDate) return false;
+            return true;
+        });
+
+        return {
+            sold: filteredOrders.length,
+            revenue: filteredOrders.reduce((acc, o) => acc + ((parseInt(o.price)||0) - (parseInt(o.discount)||0) + (parseInt(o.shipping_cost)||0)), 0)
+        };
+    }
+    
+    function updateUnreadBadges() {
+        const now = Date.now();
+        const readList = getReadOrders();
+        
+        // Filter: Belum dibaca DAN terjadi dalam 24 jam terakhir
+        const unread = orderRecords.filter(o => {
+            if (!o.orderDate) return false;
+            const orderTime = new Date(o.orderDate).getTime();
+            const isWithin24h = (now - orderTime) < (24 * 60 * 60 * 1000); // 24 jam dalam ms
+            return !readList.includes(o.id) && isWithin24h;
+        }).length;
+
+        const bOrders = document.getElementById('badge-orders');
+        if(bOrders) { 
+            bOrders.innerText = unread; 
+            bOrders.classList.toggle('hidden', unread === 0); 
+        }
+    }
+    
+    function showToast(m) { 
+        const existingToasts = document.querySelectorAll('.custom-toast');
+        existingToasts.forEach(t => t.remove());
+        const t = document.createElement('div'); 
+        t.className = "custom-toast fixed bottom-5 left-1/2 -translate-x-1/2 bg-black/80 text-white px-5 py-2 rounded-full text-xs z-[100] shadow-md animate-bounce text-center min-w-[250px]"; 
+        t.innerText = m; 
+        document.body.appendChild(t); 
+        setTimeout(() => t.remove(), 3000); 
+    }
+
+    function init() {
+        myBuyerId = localStorage.getItem('my_buyer_identity') || ('user-' + Date.now());
+        localStorage.setItem('my_buyer_identity', myBuyerId);
+
+        window.switchView = switchView; window.addToCart = addToCart; window.handleAddFood = handleAddFood; 
+        window.startEdit = startEdit; window.cancelEdit = cancelEdit; window.deleteItem = deleteItem; 
+        window.updateOrderStatus = updateOrderStatus; window.markOrderAsRead = markOrderAsRead; 
+        window.doSearch = doSearch; window.previewSelectedImage = previewSelectedImage;
+        window.updateDateFilter = updateDateFilter; window.resetDateFilter = resetDateFilter;
+        window.manualRefresh = manualRefresh;
+
+        renderAppFrame(); 
+        loadData().then(() => {
+            lastKnownOrderIds = new Set(orderRecords.map(o => String(o.id)));
+        });
+        setInterval(() => loadData(true), 15000);
+    }
+    init();
+  </script>
+ </body>
+</html>
